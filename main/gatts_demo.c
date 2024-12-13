@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <esp_event.h>
+#include <esp_wifi.h>
+#include <esp_http_client.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -33,18 +36,23 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
 #define NVS_KEY_SSID "ssid"
 #define NVS_KEY_PASS "password"
 
-
 #define WIFI_CONFIG_SERVICE_UUID   0xFFFF  // Custom UUID for WiFi config service
 #define WIFI_SSID_CHAR_UUID       0xFF01  // Custom UUID for SSID characteristic
 #define WIFI_PASS_CHAR_UUID       0xFF02  // Custom UUID for password characteristic
-#define GATTS_NUM_HANDLE_WIFI     6
+#define GATTS_NUM_HANDLE_WIFI     8
 
 #define ESP_BLE_ADV_NAME_LEN_MAX 64
 
-static char test_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = "ESP_GATTS_DEMO";
-
-// bool ssid_set = false;
-// bool pass_set = false;
+#define WIFI_SUCCESS 1
+#define URL "http://website.fis.agh.edu.pl"
+char ssid[32], pass[64];
+size_t ssid_len, pass_len;
+bool ssid_set = false, pass_set = false;
+    // bool wifi_config_changed = false;
+bool wifi_connected = false;
+static EventGroupHandle_t wifi_event_group;
+static esp_event_handler_instance_t wifi_handler_event_instance;
+static esp_event_handler_instance_t got_ip_event_instance;
 
 #define TEST_MANUFACTURER_DATA_LEN  17
 
@@ -52,36 +60,19 @@ static char test_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = "ESP_GATTS_DEMO";
 
 #define PREPARE_BUF_MAX_SIZE 1024
 
-static uint8_t char1_str[] = {0x11,0x22,0x33};
+// static uint8_t char1_str[] = {0x11,0x22,0x33};
 static esp_gatt_char_prop_t a_property = 0;
-static esp_gatt_char_prop_t b_property = 0;
 
-static esp_attr_value_t gatts_demo_char1_val =
-{
-    .attr_max_len = GATTS_DEMO_CHAR_VAL_LEN_MAX,
-    .attr_len     = sizeof(char1_str),
-    .attr_value   = char1_str,
-};
+// static esp_attr_value_t gatts_demo_char1_val =
+// {
+//     .attr_max_len = GATTS_DEMO_CHAR_VAL_LEN_MAX,
+//     .attr_len     = sizeof(char1_str),
+//     .attr_value   = char1_str,
+// };
 
 static uint8_t adv_config_done = 0;
 #define adv_config_flag      (1 << 0)
 #define scan_rsp_config_flag (1 << 1)
-
-#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
-static uint8_t raw_adv_data[] = {
-    /* Flags */
-    0x02, ESP_BLE_AD_TYPE_FLAG, 0x06,               // Length 2, Data Type ESP_BLE_AD_TYPE_FLAG, Data 1 (LE General Discoverable Mode, BR/EDR Not Supported)
-    /* TX Power Level */
-    0x02, ESP_BLE_AD_TYPE_TX_PWR, 0xEB,             // Length 2, Data Type ESP_BLE_AD_TYPE_TX_PWR, Data 2 (-21)
-    /* Complete 16-bit Service UUIDs */
-    0x03, ESP_BLE_AD_TYPE_16SRV_CMPL, 0xAB, 0xCD    // Length 3, Data Type ESP_BLE_AD_TYPE_16SRV_CMPL, Data 3 (UUID)
-};
-
-static uint8_t raw_scan_rsp_data[] = {
-    /* Complete Local Name */
-    0x0F, ESP_BLE_AD_TYPE_NAME_CMPL, 'E', 'S', 'P', '_', 'G', 'A', 'T', 'T', 'S', '_', 'D', 'E', 'M', 'O'   // Length 15, Data Type ESP_BLE_AD_TYPE_NAME_CMPL, Data (ESP_GATTS_DEMO)
-};
-#else
 
 static uint8_t adv_service_uuid128[32] = {
     /* LSB <--------------------------------------------------------------------------------> MSB */
@@ -125,8 +116,6 @@ static esp_ble_adv_data_t scan_rsp_data = {
     .p_service_uuid = adv_service_uuid128,
     .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
-
-#endif /* CONFIG_SET_RAW_ADV_DATA */
 
 static esp_ble_adv_params_t adv_params = {
     .adv_int_min        = 0x20,
@@ -173,133 +162,80 @@ typedef struct {
 } prepare_type_env_t;
 
 static prepare_type_env_t a_prepare_write_env;
-static prepare_type_env_t b_prepare_write_env;
+
+static void nvs_setup();
+static esp_err_t save_wifi_config_to_nvs(const char* key, const char* value, size_t length);
+
+static void ble_setup();
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 
 void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
 
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
-{
-    switch (event) {
-#ifdef CONFIG_SET_RAW_ADV_DATA
-    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-        adv_config_done &= (~adv_config_flag);
-        if (adv_config_done==0){
-            esp_ble_gap_start_advertising(&adv_params);
+static void wifi_setup();
+static void wifi_deinit();
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+
+void http_request(esp_http_client_method_t request_method, const char* request_url);
+esp_err_t http_request_handler(esp_http_client_event_handle_t event);
+
+void app_main(void) {
+    esp_err_t ret;
+    nvs_setup();
+    ble_setup();
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    while (true) {
+        nvs_handle_t nvs_handle;
+
+        nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+        ret = nvs_get_str(nvs_handle, NVS_KEY_SSID, ssid, &ssid_len);
+        if (ret == ESP_OK) {
+            ssid_set = true;
+            printf("SSID: %s\n", ssid);
+        } else {
+            printf("SSID not set\n");
         }
-        break;
-    case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
-        adv_config_done &= (~scan_rsp_config_flag);
-        if (adv_config_done==0){
-            esp_ble_gap_start_advertising(&adv_params);
+        ret = nvs_get_str(nvs_handle, NVS_KEY_PASS, pass, &pass_len);
+        if (ret == ESP_OK) {
+            pass_set = true;
+            printf("Password: %s\n", pass);
+        } else {
+            printf("Password not set\n");
         }
-        break;
-#else
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-        adv_config_done &= (~adv_config_flag);
-        if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
+        nvs_close(nvs_handle);
+        
+        if (ssid_set && pass_set && !wifi_connected) {
+            wifi_setup();
         }
-        break;
-    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-        adv_config_done &= (~scan_rsp_config_flag);
-        if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
+
+        if (wifi_connected) {
+            http_request(HTTP_METHOD_GET, URL);
         }
-        break;
-#endif
-    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        //advertising start complete event to indicate advertising start successfully or failed
-        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGE(GATTS_TAG, "Advertising start failed, status %d", param->adv_start_cmpl.status);
-            break;
-        }
-        ESP_LOGI(GATTS_TAG, "Advertising start successfully");
-        break;
-    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGE(GATTS_TAG, "Advertising stop failed, status %d", param->adv_stop_cmpl.status);
-            break;
-        }
-        ESP_LOGI(GATTS_TAG, "Advertising stop successfully");
-        break;
-    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-         ESP_LOGI(GATTS_TAG, "Connection params update, status %d, conn_int %d, latency %d, timeout %d",
-                  param->update_conn_params.status,
-                  param->update_conn_params.conn_int,
-                  param->update_conn_params.latency,
-                  param->update_conn_params.timeout);
-        break;
-    case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
-        ESP_LOGI(GATTS_TAG, "Packet length update, status %d, rx %d, tx %d",
-                  param->pkt_data_length_cmpl.status,
-                  param->pkt_data_length_cmpl.params.rx_len,
-                  param->pkt_data_length_cmpl.params.tx_len);
-        break;
-    default:
-        break;
+
+        // if (wifi_config_changed && wifi_connected) {
+        //     wifi_deinit();
+        //     wifi_config_changed = false;
+        // }
+
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
     }
+
+    return;
 }
 
-void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
-    esp_gatt_status_t status = ESP_GATT_OK;
-    if (param->write.need_rsp){
-        if (param->write.is_prep) {
-            if (param->write.offset > PREPARE_BUF_MAX_SIZE) {
-                status = ESP_GATT_INVALID_OFFSET;
-            } else if ((param->write.offset + param->write.len) > PREPARE_BUF_MAX_SIZE) {
-                status = ESP_GATT_INVALID_ATTR_LEN;
-            }
-            if (status == ESP_GATT_OK && prepare_write_env->prepare_buf == NULL) {
-                prepare_write_env->prepare_buf = (uint8_t *)malloc(PREPARE_BUF_MAX_SIZE*sizeof(uint8_t));
-                prepare_write_env->prepare_len = 0;
-                if (prepare_write_env->prepare_buf == NULL) {
-                    ESP_LOGE(GATTS_TAG, "Gatt_server prep no mem");
-                    status = ESP_GATT_NO_RESOURCES;
-                }
-            }
-
-            esp_gatt_rsp_t *gatt_rsp = (esp_gatt_rsp_t *)malloc(sizeof(esp_gatt_rsp_t));
-            if (gatt_rsp) {
-                gatt_rsp->attr_value.len = param->write.len;
-                gatt_rsp->attr_value.handle = param->write.handle;
-                gatt_rsp->attr_value.offset = param->write.offset;
-                gatt_rsp->attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
-                memcpy(gatt_rsp->attr_value.value, param->write.value, param->write.len);
-                esp_err_t response_err = esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, gatt_rsp);
-                if (response_err != ESP_OK){
-                    ESP_LOGE(GATTS_TAG, "Send response error\n");
-                }
-                free(gatt_rsp);
-            } else {
-                ESP_LOGE(GATTS_TAG, "malloc failed, no resource to send response error\n");
-                status = ESP_GATT_NO_RESOURCES;
-            }
-            if (status != ESP_GATT_OK){
-                return;
-            }
-            memcpy(prepare_write_env->prepare_buf + param->write.offset,
-                   param->write.value,
-                   param->write.len);
-            prepare_write_env->prepare_len += param->write.len;
-
-        }else{
-            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, NULL);
-        }
+/* ---- NVS ---- */
+static void nvs_setup() {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
-}
-
-void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
-    if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
-        ESP_LOG_BUFFER_HEX(GATTS_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
-    }else{
-        ESP_LOGI(GATTS_TAG,"Prepare write cancel");
-    }
-    if (prepare_write_env->prepare_buf) {
-        free(prepare_write_env->prepare_buf);
-        prepare_write_env->prepare_buf = NULL;
-    }
-    prepare_write_env->prepare_len = 0;
+    ESP_ERROR_CHECK(ret);
 }
 
 static esp_err_t save_wifi_config_to_nvs(const char* key, const char* value, size_t length) {
@@ -335,6 +271,104 @@ static esp_err_t save_wifi_config_to_nvs(const char* key, const char* value, siz
     return ESP_OK;
 }
 
+/* ---- BLE ---- */
+static void ble_setup() {
+    esp_err_t ret;
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_init();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_bluedroid_enable();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gap register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gatts_app_register(PROFILE_WIFI_APP_ID);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts app register error, error code = %x", ret);
+        return;
+    }
+    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
+    if (local_mtu_ret){
+        ESP_LOGE(GATTS_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
+    }
+}
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~adv_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~scan_rsp_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        //advertising start complete event to indicate advertising start successfully or failed
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising start failed, status %d", param->adv_start_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising start successfully");
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising stop failed, status %d", param->adv_stop_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising stop successfully");
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+         ESP_LOGI(GATTS_TAG, "Connection params update, status %d, conn_int %d, latency %d, timeout %d",
+                  param->update_conn_params.status,
+                  param->update_conn_params.conn_int,
+                  param->update_conn_params.latency,
+                  param->update_conn_params.timeout);
+        break;
+    case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+        ESP_LOGI(GATTS_TAG, "Packet length update, status %d, rx %d, tx %d",
+                  param->pkt_data_length_cmpl.status,
+                  param->pkt_data_length_cmpl.params.rx_len,
+                  param->pkt_data_length_cmpl.params.tx_len);
+        break;
+    default:
+        break;
+    }
+}
+
 static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     switch (event) {
     case ESP_GATTS_REG_EVT: {
@@ -349,18 +383,6 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
         if (set_dev_name_ret){
             ESP_LOGE(GATTS_TAG, "set device name failed, error code = %x", set_dev_name_ret);
         }
-#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
-        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(raw_adv_data, sizeof(raw_adv_data));
-        if (raw_adv_ret){
-            ESP_LOGE(GATTS_TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
-        }
-        adv_config_done |= adv_config_flag;
-        esp_err_t raw_scan_ret = esp_ble_gap_config_scan_rsp_data_raw(raw_scan_rsp_data, sizeof(raw_scan_rsp_data));
-        if (raw_scan_ret){
-            ESP_LOGE(GATTS_TAG, "config raw scan rsp data failed, error code = %x", raw_scan_ret);
-        }
-        adv_config_done |= scan_rsp_config_flag;
-#else
         //config adv data
         esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
         if (ret){
@@ -374,7 +396,6 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
         }
         adv_config_done |= scan_rsp_config_flag;
 
-#endif
         esp_ble_gatts_create_service(gatts_if, &gl_profile_tab[PROFILE_WIFI_APP_ID].service_id, GATTS_NUM_HANDLE_WIFI);
         break;
     }
@@ -409,11 +430,9 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
                 // Identify which characteristic was written to and save to NVS
                 if (param->write.handle == gl_profile_tab[PROFILE_WIFI_APP_ID].ssid_char_handle) {
                     ESP_LOGI(GATTS_TAG, "SSID received: %s", str_value);
-                    //ssid_set = true;
                     save_wifi_config_to_nvs(NVS_KEY_SSID, str_value, param->write.len);
                 } else if (param->write.handle == gl_profile_tab[PROFILE_WIFI_APP_ID].pass_char_handle) {
                     ESP_LOGI(GATTS_TAG, "Password received: %s", str_value);
-                    //pass_set = true;
                     save_wifi_config_to_nvs(NVS_KEY_PASS, str_value, param->write.len);
                 } else {
                     ESP_LOGI(GATTS_TAG, "Unknown characteristic value: %s", str_value);
@@ -484,10 +503,10 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
         };
         
         // Add user description descriptor
-        esp_bt_uuid_t ssid_descr_uuid = {
-            .len = ESP_UUID_LEN_16,
-            .uuid.uuid16 = ESP_GATT_UUID_CHAR_DESCRIPTION,
-        };
+        // esp_bt_uuid_t ssid_descr_uuid = {
+        //     .len = ESP_UUID_LEN_16,
+        //     .uuid.uuid16 = ESP_GATT_UUID_CHAR_DESCRIPTION,
+        // };
         
         esp_ble_gatts_add_char(gl_profile_tab[PROFILE_WIFI_APP_ID].service_handle,
                               &ssid_uuid,
@@ -518,12 +537,8 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
         ESP_LOGI(GATTS_TAG, "Characteristic add, status %d, attr_handle %d, service_handle %d",
                 param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
         
-        
-        //printf("add_char.char_uuid: %s\n", param->add_char.char_uuid.uuid.uuid128);
-
         // Store the handle based on the UUID
         if (strcmp((char*)(param->add_char.char_uuid.uuid.uuid128), WIFI_SSID_CHAR_UUID_128) == 0) {
-            //printf("Initializing ssid_char_handle: %d\n", param->add_char.attr_handle);
             gl_profile_tab[PROFILE_WIFI_APP_ID].ssid_char_handle = param->add_char.attr_handle;
         } else if (strcmp((char*)(param->add_char.char_uuid.uuid.uuid128), WIFI_PASS_CHAR_UUID_128) == 0) {
             gl_profile_tab[PROFILE_WIFI_APP_ID].pass_char_handle = param->add_char.attr_handle;
@@ -615,11 +630,6 @@ static void gatts_profile_wifi_event_handler(esp_gatts_cb_event_t event, esp_gat
             ESP_LOG_BUFFER_HEX(GATTS_TAG, param->conf.value, param->conf.len);
         }
         break;
-    case ESP_GATTS_OPEN_EVT:
-    case ESP_GATTS_CANCEL_OPEN_EVT:
-    case ESP_GATTS_CLOSE_EVT:
-    case ESP_GATTS_LISTEN_EVT:
-    case ESP_GATTS_CONGEST_EVT:
     default:
         break;
     }
@@ -639,102 +649,162 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         }
     }
 
-    /* If the gatts_if equal to profile A, call profile A cb handler,
-     * so here call each profile's callback */
-    do {
-        int idx;
-        for (idx = 0; idx < PROFILE_NUM; idx++) {
-            if (gatts_if == ESP_GATT_IF_NONE || /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
-                    gatts_if == gl_profile_tab[idx].gatts_if) {
-                if (gl_profile_tab[idx].gatts_cb) {
-                    gl_profile_tab[idx].gatts_cb(event, gatts_if, param);
-                }
-            }
+    // --------------------
+    if (gatts_if == ESP_GATT_IF_NONE || gatts_if == gl_profile_tab[0].gatts_if) {
+        if (gl_profile_tab[0].gatts_cb) {
+            gl_profile_tab[0].gatts_cb(event, gatts_if, param);
         }
-    } while (0);
+    }
+    // --------------------
 }
 
-void app_main(void)
-{
-    esp_err_t ret;
+void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    esp_gatt_status_t status = ESP_GATT_OK;
+    if (param->write.need_rsp){
+        if (param->write.is_prep) {
+            if (param->write.offset > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_OFFSET;
+            } else if ((param->write.offset + param->write.len) > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_ATTR_LEN;
+            }
+            if (status == ESP_GATT_OK && prepare_write_env->prepare_buf == NULL) {
+                prepare_write_env->prepare_buf = (uint8_t *)malloc(PREPARE_BUF_MAX_SIZE*sizeof(uint8_t));
+                prepare_write_env->prepare_len = 0;
+                if (prepare_write_env->prepare_buf == NULL) {
+                    ESP_LOGE(GATTS_TAG, "Gatt_server prep no mem");
+                    status = ESP_GATT_NO_RESOURCES;
+                }
+            }
 
-    // Initialize NVS.
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        printf("\n\n\n\n ERASE \n ERASE \n ERASE \n\n\n\n");
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+            esp_gatt_rsp_t *gatt_rsp = (esp_gatt_rsp_t *)malloc(sizeof(esp_gatt_rsp_t));
+            if (gatt_rsp) {
+                gatt_rsp->attr_value.len = param->write.len;
+                gatt_rsp->attr_value.handle = param->write.handle;
+                gatt_rsp->attr_value.offset = param->write.offset;
+                gatt_rsp->attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+                memcpy(gatt_rsp->attr_value.value, param->write.value, param->write.len);
+                esp_err_t response_err = esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, gatt_rsp);
+                if (response_err != ESP_OK){
+                    ESP_LOGE(GATTS_TAG, "Send response error\n");
+                }
+                free(gatt_rsp);
+            } else {
+                ESP_LOGE(GATTS_TAG, "malloc failed, no resource to send response error\n");
+                status = ESP_GATT_NO_RESOURCES;
+            }
+            if (status != ESP_GATT_OK){
+                return;
+            }
+            memcpy(prepare_write_env->prepare_buf + param->write.offset,
+                   param->write.value,
+                   param->write.len);
+            prepare_write_env->prepare_len += param->write.len;
+
+        }else{
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, NULL);
+        }
     }
-    ESP_ERROR_CHECK( ret );
+}
 
-    #if CONFIG_EXAMPLE_CI_PIPELINE_ID
-    memcpy(test_device_name, esp_bluedroid_get_example_name(), ESP_BLE_ADV_NAME_LEN_MAX);
-    #endif
-
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        ESP_LOGE(GATTS_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
-        return;
+void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
+        ESP_LOG_BUFFER_HEX(GATTS_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+    }else{
+        ESP_LOGI(GATTS_TAG,"Prepare write cancel");
     }
+    if (prepare_write_env->prepare_buf) {
+        free(prepare_write_env->prepare_buf);
+        prepare_write_env->prepare_buf = NULL;
+    }
+    prepare_write_env->prepare_len = 0;
+}
 
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        ESP_LOGE(GATTS_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
+/* ---- WIFI ---- */
+static void wifi_setup() {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
 
-    ret = esp_bluedroid_init();
-    if (ret) {
-        ESP_LOGE(GATTS_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
-    ret = esp_bluedroid_enable();
-    if (ret) {
-        ESP_LOGE(GATTS_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
+    wifi_init_config_t initial_wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&initial_wifi_config));
 
-    ret = esp_ble_gatts_register_callback(gatts_event_handler);
-    if (ret){
-        ESP_LOGE(GATTS_TAG, "gatts register error, error code = %x", ret);
-        return;
-    }
-    ret = esp_ble_gap_register_callback(gap_event_handler);
-    if (ret){
-        ESP_LOGE(GATTS_TAG, "gap register error, error code = %x", ret);
-        return;
-    }
-    ret = esp_ble_gatts_app_register(PROFILE_WIFI_APP_ID);
-    if (ret){
-        ESP_LOGE(GATTS_TAG, "gatts app register error, error code = %x", ret);
-        return;
-    }
-    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
-    if (local_mtu_ret){
-        ESP_LOGE(GATTS_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
-    }
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &wifi_handler_event_instance));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL, &got_ip_event_instance));
 
-    while (true) {
-        nvs_handle_t nvs_wifi_config;
-        char ssid_value[33];
-        size_t ssid_len;
-        nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_wifi_config);
-        nvs_get_str(nvs_wifi_config, NVS_KEY_SSID, ssid_value, &ssid_len);
-        nvs_close(nvs_wifi_config);
-        printf("SSID: %s\n", ssid_value);
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "",
+            .password = "",
+	        .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    strncpy((char *) wifi_config.sta.ssid, ssid, sizeof (wifi_config.sta.ssid));
+    strncpy((char *) wifi_config.sta.password, pass, sizeof (wifi_config.sta.password));
 
-        char pass_value[33];
-        size_t pass_len;
-        nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_wifi_config);
-        nvs_get_str(nvs_wifi_config, NVS_KEY_PASS, pass_value, &pass_len);
-        nvs_close(nvs_wifi_config);
-        printf("PASS: %s\n", pass_value);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_SUCCESS, pdFALSE, pdFALSE, portMAX_DELAY);
+    if (!(bits & WIFI_SUCCESS)) {
+        printf("Wystąpił nieoczekiwany błąd przy łąćzeniu z Wi-Fi.\n");
     }
+}
 
-    return;
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        printf("Łączenie z Access Point...\n");
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        wifi_connected = true;
+
+        printf("Połączono z Access Point.\n");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
+
+		printf("Łączenie z Access Point...\n");
+        esp_wifi_connect();
+    }
+}
+
+static void ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        printf("Uzyskany adres IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_SUCCESS);
+    }
+}
+
+static void wifi_deinit() {
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, got_ip_event_instance));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler_event_instance));   
+    vEventGroupDelete(wifi_event_group);
+}
+
+/* ---- HTTP ---- */
+void http_request(esp_http_client_method_t request_method, const char* request_url) {
+    esp_http_client_config_t http_request_config = {
+        .url = request_url,
+        .method = request_method,
+        .cert_pem = NULL,
+        .event_handler = http_request_handler
+    };
+
+    if (wifi_connected) {
+        esp_http_client_handle_t client = esp_http_client_init(&http_request_config);
+        esp_http_client_perform(client);
+        esp_http_client_cleanup(client);
+    }
+}
+
+esp_err_t http_request_handler(esp_http_client_event_handle_t event) {
+    if (event->event_id == HTTP_EVENT_ON_DATA) {
+        printf("%.*s\n", event->data_len, (char *) event->data);
+    }
+    return ESP_OK;
 }
